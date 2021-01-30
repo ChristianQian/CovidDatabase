@@ -1,0 +1,173 @@
+DROP TABLE IF EXISTS tmp;
+DROP TABLE IF EXISTS infectionorigin;
+DROP TABLE IF EXISTS infection;
+DROP TABLE IF EXISTS patient;
+DROP TABLE IF EXIsTS region;
+
+-- importer les données dans un tableau temp pour séparer en 2 tables
+CREATE TEMP TABLE tmp (
+    patient_id BIGINT,
+    sex VARCHAR(10),
+    age VARCHAR(5),
+    country VARCHAR(20),
+    province VARCHAR(20),
+    city VARCHAR(20),
+    infection_case VARCHAR(50),
+    infected_by BIGINT,
+    contact_number BIGINT,
+    confirmed_date DATE,
+    released_date DATE,
+    deceased_date DATE,
+    state VARCHAR(20)
+);
+CREATE INDEX tmp_country ON tmp(country);
+CREATE INDEX tmp_province ON tmp(province);
+CREATE INDEX tmp_city ON tmp(city);
+CREATE INDEX tmp_pid ON tmp(patient_id);
+CREATE INDEX tmp_inf ON tmp(infected_by);
+
+CREATE TABLE region (
+    code INTEGER UNIQUE,
+    province VARCHAR(20),
+    city VARCHAR(20),
+    elementary_school_count INTEGER,
+    kindergarten_count INTEGER,
+    university_count INTEGER,
+    PRIMARY KEY (code, province, city)
+);
+
+-- ville d'origine du patient
+CREATE TABLE patient (
+    patient_id BIGINT PRIMARY KEY,
+    sex VARCHAR(10),
+    age INTEGER,
+    country VARCHAR(20)
+);
+
+-- province/ville d'infection en Corée
+CREATE TABLE infectionorigin (
+    patient_id BIGINT REFERENCES patient(patient_id) ON DELETE CASCADE,
+    infected_by BIGINT REFERENCES patient(patient_id) ON DELETE CASCADE,
+    code INTEGER NOT NULL REFERENCES region(code) ON DELETE CASCADE,
+    infection_case VARCHAR(50),
+    contact_number BIGINT,
+    confirmed_date DATE NOT NULL,
+    released_date DATE,
+    deceased_date DATE,
+    state VARCHAR(20) NOT NULL,
+    PRIMARY KEY (patient_id, infected_by, confirmed_date)
+);
+CREATE INDEX info_code_fk ON infectionorigin(code);
+
+CREATE TABLE infection (
+    patient_id BIGINT REFERENCES patient(patient_id) ON DELETE CASCADE,
+    code INTEGER NOT NULL REFERENCES region(code) ON DELETE CASCADE,
+    infection_case VARCHAR(50),
+    contact_number BIGINT,
+    confirmed_date DATE NOT NULL,
+    released_date DATE,
+    deceased_date DATE,
+    state VARCHAR(20) NOT NULL,
+    PRIMARY KEY (patient_id, confirmed_date)
+);
+CREATE INDEX inf_code_fk ON infection(code);
+
+-- NETTOYAGE DES DONNEES
+
+-- AJOUT REGION
+\copy region FROM PROGRAM 'cut -d "," -f 1,2,3,6,7,8 /home/netbook/Documents/BD/neo4/projet/archive/Region.csv' WITH (FORMAT CSV, HEADER);
+
+-- AJOUT TMP => PERSON & INFECTION 
+-- supprimé à la main dans PatientInfo des valeurs non valide (espaces, tirets ...) 
+\copy tmp from PROGRAM 'cut -d "," -f 1,2,3,4,5,6,7,8,9,11,12,13,14 /home/netbook/Documents/BD/neo4/projet/archive/PatientInfoClean.csv' WITH (FORMAT CSV, HEADER);
+
+-- supprimer les provinces/villes non valides et changer les colonnes par leur code postal
+DELETE FROM tmp WHERE city IS NULL OR confirmed_date IS NULL OR (province,city) NOT IN (SELECT province,city from region);
+UPDATE tmp t SET province=r.code from region r where t.province=r.province and t.city=r.city;
+ALTER TABLE tmp DROP COLUMN city, ALTER COLUMN province TYPE INTEGER USING province::integer;
+ALTER TABLE tmp RENAME province TO code;
+
+-- changer le type age(varchar) en integer
+UPDATE tmp SET age = regexp_replace(age, '[[:alpha:]]','','g');
+ALTER TABLE tmp ALTER COLUMN age TYPE INTEGER USING age::integer;
+
+-- AJOUT PATIENT
+INSERT INTO patient
+SELECT DISTINCT ON (patient_id) patient_id, sex, age, country FROM tmp;
+    
+-- AJOUT INFECTIONORIGIN
+-- filtre infected_by avec valeur null et non inclus dans patient_id (6100000384, 12702, 2017000005, 2002000001 ...  environ 45 lignes)
+INSERT INTO infectionorigin
+SELECT patient_id, infected_by, code, infection_case, contact_number, confirmed_date, released_date, deceased_date, state
+FROM tmp WHERE infected_by IN (SELECT patient_id from tmp);
+
+UPDATE infectionorigin
+SET contact_number = 1
+WHERE contact_number IS NULL OR contact_number=0;
+   
+-- AJOUT INFECTION
+INSERT INTO infection
+SELECT patient_id, code, infection_case, contact_number, confirmed_date, released_date, deceased_date, state
+FROM tmp WHERE infected_by IS NULL;
+
+UPDATE infection
+SET contact_number = 0
+WHERE contact_number IS NULL;
+
+-- export csv, choisir un dossier public + chmod 777
+\copy patient TO '/tmp/Patient.csv' DELIMITER ',' CSV HEADER;
+\copy infectionorigin TO '/tmp/InfectionOrigin.csv' DELIMITER ',' CSV HEADER;
+\copy infection TO '/tmp/Infection.csv' DELIMITER ',' CSV HEADER;
+\copy region TO '/tmp/Region.csv' DELIMITER ',' CSV HEADER;
+
+
+-- CLEAN IMPORT (CREATE TABLE + INDEX FIRST)
+\copy region FROM '/home/netbook/Documents/S1/BD/neo4/projet/cleandata/Region.csv' WITH (FORMAT CSV, HEADER);
+\copy patient FROM '/home/netbook/Documents/S1/BD/neo4/projet/cleandata/Patient.csv' WITH (FORMAT CSV, HEADER);
+\copy infectionorigin FROM '/home/netbook/Documents/S1/BD/neo4/projet/cleandata/InfectionOrigin.csv' WITH (FORMAT CSV, HEADER);
+\copy infection FROM '/home/netbook/Documents/S1/BD/neo4/projet/cleandata/Infection.csv' WITH (FORMAT CSV, HEADER);
+
+
+
+
+--QUERY
+
+
+//les chemins de taille 5 partant de l'origine 4100000006
+//lignes avec doublons correspondant au résultat de Neo4j
+EXPLAIN ANALYZE
+WITH RECURSIVE chaine(victime, n_origine) AS (
+    VALUES(4100000006::BIGINT, 0)
+    UNION 
+    SELECT i.patient_id, n_origine + 1
+    FROM chaine c, infectionorigin i, region r, patient p
+    WHERE c.victime=i.infected_by AND i.code=r.code AND c.victime=p.patient_id
+    AND p.country='Korea' AND r.province='Chungcheongnam-do' 
+    AND (r.city='Asan-si' OR r.city='Cheonan-si') AND p.age<=50
+    AND n_origine < 5
+)
+SELECT * 
+FROM chaine c, patient p
+WHERE c.victime=p.patient_id
+ORDER BY n_origine;
+
+
+//chemin sans aller-retour sur 4100000006 = nombre de noeud affiché sur Neo4j
+EXPLAIN ANALYZE
+WITH RECURSIVE chaine(victime, n_origine) AS (
+    VALUES(4100000006::BIGINT, 0)
+    UNION 
+    SELECT i.patient_id, n_origine + 1
+    FROM chaine c, infectionorigin i, region r, patient p
+    WHERE c.victime=i.infected_by AND i.code=r.code AND c.victime=p.patient_id
+    AND p.country='Korea' AND r.province='Chungcheongnam-do' 
+    AND (r.city='Asan-si' OR r.city='Cheonan-si') AND p.age<=50
+    AND i.patient_id<>4100000006
+    AND n_origine < 5
+)
+SELECT * 
+FROM chaine c, patient p
+WHERE c.victime=p.patient_id
+ORDER BY n_origine;
+
+
